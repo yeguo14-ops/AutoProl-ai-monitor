@@ -1,4 +1,4 @@
-# AotuPC_ai_monitor · 全栈资源监控平台 · 架构与技术点解读
+﻿# AotuPC_ai_monitor · 全栈资源监控平台 · 架构与技术点解读
 
 > 自我讲述：理解每个模块做什么、用了什么技术、为什么这么设计。
 > 全文约 2000 字，读完能对着架构图讲清楚整条链路。
@@ -11,7 +11,7 @@
 
 它不是一个单语言单进程程序，而是 **Python + Java + MySQL 三种技术栈的分布式协作**，用 **Docker 容器编排**把它们组织起来。
 
-## 二、整体架构：三容器 + 一个 Agent
+## 二、整体架构：三容器 + Agent 上报
 
 ```
 ┌─────────────── 被监控主机（Agent 模式）───────────────┐
@@ -21,8 +21,8 @@
 ┌────────────────────────▼──────────────────────────────┐
 │  docker-compose 三容器（控制端）                        │
 │                                                        │
-│  [web]  Python: Flask 展示 + 主循环采集调度 + 告警      │
-│    │      （main.py 采集 / app.py Flask / alerter 告警）│
+│  [web]  Python: Flask 展示 + 告警决策                    │
+│    │      （app.py Flask / alerter 告警）              │
 │    │ HTTP /api/ai/analyze/log                          │
 │  [java-ai] Java Spring Boot: 调用 DeepSeek 大模型分析日志│
 │    │                                                   │
@@ -30,7 +30,7 @@
 └────────────────────────────────────────────────────────┘
 ```
 
-关键设计：**采集有两种模式**。一是控制端容器内由 `main.py` 主循环自己采集（`RUN_MONITOR_SCHEDULER=true`）；二是**被监控主机上装 Agent**（`agent.py`），它独立采集并通过 HTTP 把数据上报给控制端 Web。第二种是生产推荐做法——控制端容器不该拿自己的容器 ID 当主机名，而且可以横向监控任意多台机器。
+关键设计：**采集统一走 Agent 模式**。每台被监控主机上跑 `agent.py`，独立采集本机指标并通过 HTTP POST 上报给控制端 Web。这种模式天然支持横向扩展——加一台机器就装一个 Agent，控制端不用改任何配置。
 
 ## 三、各模块与技术点拆解（每个 part 做了什么）
 
@@ -40,14 +40,12 @@
 
 - **入口层（根目录）**
 
-  - `main.py`：采集入口1。`sys.pycache_prefix=./cache/` 控制字节码缓存位置；启动时加载 `.env`、打日志、进 `main_loop()`。
   - `app.py`：Flask Web 服务，对外提供 `/api/hosts`、`/api/report`、`/health` 等 REST 接口，渲染 `templates/` 下的页面。**Agent 就是往这里的 `/api/report` 上报数据。**
-  - `agent.py`：被控端 Agent，采集本机指标后 POST 到控制端，采集入口2。
+  - `agent.py`：被控端 Agent，采集本机指标后 POST 到控制端，是唯一采集入口。
 
 - **业务层（monitor/services/）**——只做判断，不直接碰数据库/邮件
 
-  - `scheduler.py`：主循环调度，按 `COLLECT_INTERVAL` 周期驱动采集→落库→告警，是"心脏"。
-  - `collector.py`：用 **psutil** 采集 CPU / 内存 / 磁盘 / 系统日志尾部；把日志交给 AI 分析，并融合 Java 侧返回的动态 CPU 基线。
+  - `collector.py`：接收 Agent 上报的数据，融合 AI 分析结果，做指标增强。
   - `alerter.py`：告警决策。**融合动态阈值 + AI 风险等级**：若 Java 侧返回了动态 CPU 基线则用动态值，否则用环境变量静态阈值；CPU/内存/磁盘逐项比较，AI 判定 HIGH/CRITICAL 时追加"高风险日志"告警。
   - `ai_analyzer.py`：本地关键词兜底分析（error/timeout/oom/denied），当 AI 服务不可用时降级。
 
@@ -71,7 +69,7 @@
 
 ### 3. 数据存储（MySQL 8）
 
-`storage.py` 把每台主机每轮采集的指标写入 MySQL（表按主机、时间组织），Web 端从库里读数据做展示，历史数据可回看。
+`storage.py` 把每台主机每轮上报的指标写入 MySQL（表按主机、时间组织），Web 端从库里读数据做展示，历史数据可回看。
 
 ## 四、部署与一键启动
 
@@ -82,17 +80,15 @@ cp docker/defaults.compose.env .env   # 首次：生成配置（端口/密码/�
 docker-compose build web && docker-compose up -d
 ```
 
-三服务依赖链：`mysql → java-ai → web`（`depends_on` 列表顺序保证先起数据库再起业务）。web 容器 `env_file: .env` 注入所有配置，入口 `docker/entrypoint.sh`：后台跑 `python main.py`（调度，可选）+ 前台 `python app.py`（Flask）。Java 镜像 `ai-monitor-service:latest`，Python 用本仓库 Dockerfile 多阶段构建。端口做了宿主映射（MySQL 3307 / Flask 5000 / Java 8080），避免与本机冲突。
+三服务依赖链：`mysql → java-ai → web`（`depends_on` 列表顺序保证先起数据库再起业务）。web 容器 `env_file: .env` 注入所有配置，入口 `docker/entrypoint.sh`：前台 `python app.py`（Flask）。Java 镜像 `ai-monitor-service:latest`，Python 用本仓库 Dockerfile 多阶段构建。端口做了宿主映射（MySQL 3307 / Flask 5000 / Java 8080），避免与本机冲突。
 
-**Ansible 自动化部署**：`ansible/deploy.yml` 用 playbook 在目标 Ubuntu 上装 Docker、同步整个项目、执行 `docker-compose up -d --build`，实现"根目录一键部署到任意机器"。这就是你说的"Ansible 一键启动"——它把 Docker 的编排能力再包一层，变成**可复制、可批量、声明式**的部署。
-
-> 小提示：当前 `deploy.yml` 的实现在被控端装 Agent（Python 上报模式）；`ansible/README.txt` 里描述的另一套"装 Docker + compose up"是更完整的控制端批量部署方案，面试时两种都能讲，但以代码实际为准。
+**Ansible 自动化部署**：`ansible/deploy.yml` 在目标 Ubuntu 上装 Docker、同步整个项目、执行 `docker-compose up -d --build`，实现"一键部署到任意机器"。同时在被控主机装 `agent.py` + systemd 守护，开机自启上报。
 
 ## 五、完整数据流转时序
 
 1. **Agent 侧**（被控主机）：`agent.py` 每 60s 用 psutil 采集指标 + 系统日志尾部 → `POST http://控制端:5000/api/report` 上报。
 2. **控制端接收**：`app.py` 的 `/api/report` 接口收到数据，交给业务层处理。
-3. **AI 分析**：`collector.py` 把日志文本交给 `ai_java_client` → 调 Java `/api/ai/analyze/log` → `DeepSeekService` 调 DeepSeek 大模型 → 返回 `{errorType, riskLevel, possibleCause, suggestion}`（结果在 Java 侧被 Caffeine 缓存，同一日志不重复付费调用）。若 Java 不可用，Python 侧 `ai_analyzer` 用关键词兜底。
+3. **AI 分析**：`ai_java_client` 把日志文本交给 Java `/api/ai/analyze/log` → `DeepSeekService` 调 DeepSeek 大模型 → 返回 `{errorType, riskLevel, possibleCause, suggestion}`（结果在 Java 侧被 Caffeine 缓存，同一日志不重复付费调用）。若 Java 不可用，Python 侧 `ai_analyzer` 用关键词兜底。
 4. **落库**：指标 + AI 结论经 `storage.py` 写入 MySQL（写失败降级本地 JSON + 重试）。
 5. **告警决策**：`alerter.py` 比较 CPU/内存/磁盘与阈值（优先动态基线），并检查 AI riskLevel；触发后经 `redis_client` 冷却防刷 → `email_sender` 发邮件。
 6. **展示**：`app.py` 从 MySQL 读历史数据，渲染 Web 页面供查看。
@@ -101,7 +97,7 @@ docker-compose build web && docker-compose up -d
 
 | 技术点                             | 用在哪里                         | 解决什么问题              |
 | ------------------------------- | ---------------------------- | ------------------- |
-| Python psutil                   | collector/agent 采集           | 跨平台取 CPU/内存/磁盘      |
+| Python psutil                   | agent 采集                    | 跨平台取 CPU/内存/磁盘      |
 | Flask + 模板                      | app.py Web 展示                | REST 接口 + 页面渲染      |
 | PyMySQL                         | storage 落库                   | 写 MySQL，失败降级文件缓存    |
 | Redis + 冷却键                     | redis_client                 | 告警防刷，避免 5 分钟内重复轰炸   |
@@ -111,9 +107,9 @@ docker-compose build web && docker-compose up -d
 | @Cacheable + Caffeine + SHA-256 | DeepSeekService/KeyGenerator | 缓存分析结果，避免重复付费与碰撞    |
 | 降级兜底                            | ai_analyzer / Service 异常处理   | AI 挂了系统仍可用          |
 | docker-compose 三容器              | 部署编排                         | 异构语言互通，依赖有序         |
-| Ansible                         | 批量部署                         | 一键把平台装到多台服务器        |
+| Ansible                         | 批量部署 + Agent 下发             | 一键把平台装到多台服务器        |
 | 环境变量注入密钥                        | .env / 环境变量                  | 密钥不入库、日志脱敏          |
 
 ## 七、一句话总结
 
-> "实现了一个跨语言的服务器监控告警平台：**Python** 负责采集、落库、告警与 Web 展示，**Java(Spring Boot)** 负责调用 **DeepSeek 大模型**做日志 AI 分析，**MySQL** 存储、**Redis** 做告警防刷，三者在 **docker-compose** 中编排成 mysql/java-ai/web 三容器协作，再用 **Ansible** 一键批量部署到多台服务器。技术点覆盖 psutil 采集、WebClient 异步调用大模型、Caffeine+@Cacheable 缓存、邮件告警、降级兜底与动态阈值告警。"
+> "实现了一个跨语言的服务器监控告警平台：**Python** 负责接收 Agent 上报、落库、告警与 Web 展示，**Java(Spring Boot)** 负责调用 **DeepSeek 大模型**做日志 AI 分析，**MySQL** 存储、**Redis** 做告警防刷，三者在 **docker-compose** 中编排成 mysql/java-ai/web 三容器协作，被控主机跑 **agent.py** 上报数据，再用 **Ansible** 一键批量部署。技术点覆盖 psutil 采集、WebClient 异步调用大模型、Caffeine+@Cacheable 缓存、邮件告警、降级兜底与动态阈值告警。"
